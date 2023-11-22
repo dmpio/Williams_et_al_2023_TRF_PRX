@@ -1,0 +1,534 @@
+---
+title: "Analysis of TRF1 SKM TMT proteomics data"
+author: "Scott Lyons"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+  pdf_document: default
+---
+
+## Background
+Analysis of the TRF1 SKM TMT proteomics data that was searched using fragpipe and will be analyzed using MSstatsTMT.
+
+
+### load packages
+```{r message=FALSE}
+
+library(tidyverse)   
+library(MSstatsTMT)
+library(data.table)   
+library(ggprism)
+library(ggrepel)
+library(openxlsx)
+library(pathfindR)
+library(msigdbr)
+
+```
+
+### Load in meta data and protein data. 
+Protein data will be used later on to add annotation to the final MSstats dataframe.
+```{r}
+
+#df = fread("trf1_skm_data/20220908_trf1_skm_fargpipe_msstats.csv")
+
+protein = fread("data/20220908_trf1_skm_fargpipe_msstats_protein.tsv")
+
+all_meta = read_csv("data/20220908_TRF1_skm_MSstats_annotation_fragpipeV1.csv", show_col_types = FALSE)
+
+
+## the sample "TRF1" is a known outlier and needs to be removed from both the meta and quant data
+
+prot_meta = all_meta %>%
+  filter(!grepl('phos', Run)) %>%
+  filter(BioReplicate != 'TRF1')
+
+
+```
+
+### load in msstats.csv file
+currently the MSstats export from fragpipe for TMT data doesn't seem to be supposed in the proteinSummarization function so conversion first by PhilosophertoMSstatsTMTFormat is required. 
+```{r}
+
+protein_df = MSstatsTMT::PhilosophertoMSstatsTMTFormat(
+  input = 'M:/Proteomics_Lab/Lab.Equipment/Proteome.Discoverer.PC/scott.lyons/fragpipe_TRF1_skm_TMT_input_phos/Run02/msstats.csv', 
+  annotation = prot_meta, 
+  which.proteinid = 'Protein.Accessions', 
+  use_log_file = F)
+
+
+```
+### protein summarization 
+```{r results = 'hide'}
+
+summary = proteinSummarization(protein_df,
+                               method = 'msstats',
+                               reference_norm = F,
+                               use_log_file = FALSE)
+
+```
+### Statistical analysis
+```{r warning=FALSE, results='hide'}
+
+levels(summary$ProteinLevelData$Condition)
+
+compare1 = matrix(c(-1,1), nrow = 1)
+comparison = rbind(compare1)
+rownames(comparison) = c('TRF-AL')
+colnames(comparison) = c('AL', 'TRF')
+
+test = groupComparisonTMT(summary,
+                          contrast.matrix = comparison,
+                          use_log_file = F)
+
+
+
+```
+
+
+### add in mitocarta and protein annotation columns
+```{r}
+
+mitocarta = read.delim('db/Mouse.MitoCarta3.0.txt') %>%
+  dplyr::select(gene_symbol = Symbol, carta_accession = accession, MitoCarta3.0_SubMitoLocalization, MitoCarta3.0_MitoPathways) %>%
+  mutate(gene_symbol = gene_symbol)
+
+add_cols = protein %>%
+  dplyr::select(., `Protein ID` , `Gene`, `Protein Description`, Organism, `Protein Probability`, contains("peptide")) %>%
+  distinct(., `Protein ID`, .keep_all = T)
+
+
+int = test$ComparisonResult %>%
+  dplyr::select(., any_of(c('Protein','Label', 'log2FC', 'pvalue', 'adj.pvalue'))) %>%
+  drop_na(., pvalue) %>%
+  pivot_wider(names_from = c(Label), values_from = c(log2FC, pvalue, adj.pvalue)) %>%
+  separate(Protein, c('db' ,'accession', 'gene_symbol'), sep = "\\|") %>%
+  left_join(., add_cols, by = c('accession' = 'Protein ID')) %>%
+  left_join(., mitocarta, by = c("Gene" = "gene_symbol")) %>%
+  mutate(mitocarta_gene = toupper(Gene) %in% mitocarta$gene_symbol | grepl('mitochondrial', `Protein Description`) | accession %in% mitocarta$carta_accession) %>%
+  dplyr::select(., gene_symbol = Gene, accession , Description = `Protein Description`, contains('mitocarta'), contains('FC') | contains('pvalue'))
+
+# This code block extracts the ind quant values and then takes the average of the Bioreplicates, which consists of the technical replicate data abundance values.
+
+quant = summary$ProteinLevelData %>%
+  dplyr::select(., c('Protein', 'Abundance', 'BioReplicate', 'Condition', 'TechRepMixture')) %>%
+  #filter(Condition != 'pool') %>%
+  group_by(Protein, BioReplicate) %>%
+  mutate(mean_abundance = mean(Abundance, na.rm=T)) %>%
+ # filter(TechRepMixture == 1) %>%
+  dplyr::select(., -any_of(c("TechRepMixture", "Abundance", "Condition")))%>%
+  #group_by(Protein) %>%
+  distinct(., BioReplicate, .keep_all = T) %>%
+  pivot_wider(names_from = BioReplicate, values_from = mean_abundance, names_prefix = "abundance_") %>%
+  separate(Protein, c('db' ,'accession', 'gene_symbol'), sep = "\\|") %>%
+  left_join(., add_cols, by = c('accession' = 'Protein ID')) %>%
+  left_join(., mitocarta, by = c("Gene" = "gene_symbol")) %>%
+  mutate(mitocarta_gene = toupper(Gene) %in% mitocarta$gene_symbol | grepl('mitochondrial', `Protein Description`) | accession %in% mitocarta$carta_accession) %>%
+  dplyr::select(., gene_symbol = Gene, accession, Description = `Protein Description`, contains('mito', ignore.case=TRUE), contains("Protein"), contains("peptide"), contains("abundance"))
+
+
+jn = left_join(quant, int)
+
+jn2 = jn %>%
+  dplyr::select(., gene_symbol, accession, Description, contains("mito", ignore.case=TRUE), contains("Protein"),
+                contains("peptide"), contains("abundance"), contains("FC") | contains("pvalue"))
+
+write.xlsx(jn, paste(Sys.Date(), 'TRF1_SKM_TMT_less_specific_carta_join.xlsx', sep='_'))
+
+
+```
+
+```{r}
+
+quant %>%
+  filter(Protein == 'contam_sp|P00761|TRYP_PIG') %>%
+  group_by(Condition) %>%
+  summarize(mean = mean(mean_abundance))
+```
+
+
+
+## testing
+trying to figure out how MSstats deals with technical replicates
+does it take the mean of each conditions within a technical replicate, then another mean of all tech replicates. Or does it take the mean of all channels first, then perfrom the group mean?
+
+I overthought this by alot. 
+```{r}
+
+summary$ProteinLevelData %>%
+  filter(Protein == "contam_sp|P00761|TRYP_PIG") %>%
+  group_by(Condition) %>%
+  summarize(mean = mean(Abundance))
+
+
+# answer is it just takes the mean of all conditions. easy then 
+```
+
+
+## making spreadhheet for initial paper submission
+
+```{r}
+
+mitocarta2 = rename(mitocarta, accession = carta_accession)
+
+int = map(1:8, function(x){
+  
+  df3 = read.xlsx("trf1_skm_data/Copy of Copy of 2022-10-19_TRF1_SKM_TMT_Fragpipe_msstats.dm.v3.xlsx", sheet = x)
+  
+  df3_mito = df3 %>%
+    dplyr::select(., -contains("SubMito"), -contains("MitoPathways")) %>%
+    left_join(., mitocarta2)
+})
+
+write.xlsx(int, paste0("SPL_", Sys.Date(), "TRF1_skm_ptx_pathways.xlsx"))
+
+```
+
+
+
+### volcano plot
+```{r fig.width=5.0, fig.height=4.5}
+
+volcano_plot = function(df, type, interactive, filter_mito = T, plot_title, save){
+  
+  mix = lapply(rownames(comparison), function(y){
+    
+    volcano = df %>%
+      {if(filter_mito == T) filter(., mitocarta_gene == T) else .} %>%
+      dplyr::select(., gene_symbol, contains(y)) %>%
+      dplyr::select(gene_symbol, FC = contains("FC"), p_value = starts_with("pvalue"), q_value = starts_with("adj.pvalue"))%>%
+      mutate(p_value = -log10(p_value), .keep = c("unused")) %>%
+      #mutate(mitocarta = gene_symbol %in% mito_carta$Symbol | entrez_gene_id %in% mito_carta$GeneName) %>%
+      drop_na(gene_symbol) %>%
+      filter(!is.na(FC)) %>%
+      mutate(q_sig = q_value <= 0.05)
+    
+    neg_chg = volcano %>%
+      filter(q_value < 0.05 & FC < 0) %>%
+      summarize(counts  = n())
+    
+    pos_chg = volcano %>%
+      filter(q_value < 0.05 & FC > 0) %>%
+      summarize(n())
+    
+    save_name = paste(y, plot_title)
+    
+    if(type == "protein"){
+      q = ggplot(volcano, aes(x = FC, y = p_value, shape = q_sig, text = gene_symbol, q_value = q_value)) +
+        geom_point(shape = 21, size = 2.5, color = 'black', stroke = 1,
+                   fill = ifelse(volcano$q_value < 0.05 & volcano$FC > 0, "#A00000",
+                                 ifelse(volcano$q_value < 0.05 & volcano$FC < 0, "#0000C0", "#D4D4D4")))+
+        scale_x_continuous(breaks=seq(min(floor(volcano$FC), na.rm=T), max(ceiling(volcano$FC), na.rm=T), 1), 
+                           limits = c(min(floor(volcano$FC), na.rm=T), max(ceiling(volcano$FC), na.rm=T)))+
+        scale_y_continuous(breaks=seq(0, max(ceiling(volcano$p_value)), 1), limits = c(0, max(ceiling(volcano$p_value))))+
+        theme_prism()+
+        #xlim(c(-2.25,2.25))+
+        geom_hline(aes(yintercept = 1.3), linetype = "dashed", size = 1.5)+
+        labs(title = paste(plot_title, "\n", y, "\n", sep = " "),
+             x = paste("Log2 fold change", "\n", y), y = "-log10 p-value",
+             shape = "q<0.05")
+      
+      
+      if(interactive == TRUE & save == FALSE){
+        w = ggplotly(q, tooltip = 'all')
+        print(w)
+      }
+      else if(interactive == TRUE & save == TRUE){
+        w = ggplotly(q, tooltip = 'all')
+        saveWidget(w, paste0(save_name, ".html"), selfcontained = T, libdir = "lib")
+      }
+      else if(interactive == FALSE & save == FALSE){
+        q1 = q + annotate("text", label = neg_chg, x = min(floor(volcano$FC)) + 0.2, y = max(ceiling(volcano$p_value))) +
+          annotate("text", label = pos_chg, x = max(ceiling(volcano$FC)) - 0.2 , y = max(ceiling(volcano$p_value)))
+        
+        print(q1)
+      }
+      else if(interactive == FALSE & save == TRUE){
+        q1 = q + annotate("text", label = neg_chg, x = min(floor(volcano$FC)) + 0.2, y = max(ceiling(volcano$p_value))) +
+          annotate("text", label = pos_chg, x = max(ceiling(volcano$FC)) - 0.2 , y = max(ceiling(volcano$p_value)))
+        
+        ggsave(q1, filename = paste0(save_name, ".pdf"), units = "in", bg='transparent', height = 5, width = 6)
+        while (!is.null(dev.list()))  dev.off()
+      }
+    }
+    
+  })
+  
+}
+
+v_plot = volcano_plot(df=int, type = 'protein', interactive = F, filter_mito = F,
+                      plot_title = "SkM Proteomics",  save = F)    
+
+
+```
+
+
+### custom volcano plot
+custom volcano plot to show location of proteins associated with different pathways.
+```{r fig.width=5.0, fig.height=4.5}
+
+tca = read.xlsx("trf1_skm_data/Copy of Copy of 2022-10-19_TRF1_SKM_TMT_Fragpipe_msstats.dm.xlsx", sheet = 5)[,2]
+etc = read.xlsx("trf1_skm_data/Copy of Copy of 2022-10-19_TRF1_SKM_TMT_Fragpipe_msstats.dm.xlsx", sheet = 7)[,2]
+atps = read.xlsx("trf1_skm_data/Copy of Copy of 2022-10-19_TRF1_SKM_TMT_Fragpipe_msstats.dm.xlsx", sheet = 6)[,2]
+mr = read.xlsx("trf1_skm_data/Copy of Copy of 2022-10-19_TRF1_SKM_TMT_Fragpipe_msstats.dm.xlsx", sheet = 8)[,2]
+
+int2 = int %>%
+  mutate("tca" = accession %in% tca) %>%
+  mutate("etc" = accession %in% etc) %>%
+  mutate("atps" = accession %in% atps) %>%
+  mutate("mr" = accession %in% mr)
+
+to_label = c("Gls", "Mrpl16", "Slirp", "Coa6")
+
+# Custom colored plot for TRF paper
+volcano_plot = function(df, type, interactive, filter_mito = T, plot_title, save){
+  
+  mix = lapply(rownames(comparison), function(y){
+    
+    volcano = df %>%
+      {if(filter_mito == T) filter(., mitocarta_gene == T) else .} %>%
+      dplyr::select(., gene_symbol, where(is.logical), contains(y)) %>%
+      dplyr::select(gene_symbol, where(is.logical), FC = contains("FC"), p_value = starts_with("pvalue"), q_value = starts_with("adj.pvalue")) %>%
+      mutate(trans_p_value = -log10(p_value)) %>%
+      drop_na(gene_symbol) %>%
+      filter(!is.na(FC)) %>%
+      mutate(q_sig = q_value <= 0.05)
+    
+    neg_chg = volcano %>%
+      filter(p_value < 0.05 & FC < 0) %>%
+      summarize(counts  = n())
+    
+    pos_chg = volcano %>%
+      filter(p_value < 0.05 & FC > 0) %>%
+      summarize(n())
+    
+    save_name = paste(y, plot_title)
+    
+    if(type == "protein"){
+     q= ggplot(volcano, aes(x = FC, y = trans_p_value, text = gene_symbol)) +
+        geom_point(data = volcano, shape = 21, size = 2.5, stroke = 1, 
+                   color = ifelse(volcano$etc == TRUE, "#000080",
+                               ifelse(volcano$mr == TRUE, "#A00000", "black")), 
+                   fill = ifelse(volcano$etc == TRUE, "#66CCFF",
+                          #ifelse(volcano$tca == TRUE, "darkorchid1",
+                          #ifelse(volcano$atps == TRUE, "cadetblue1",
+                          ifelse(volcano$mr == TRUE, "#FF8080",
+                          ifelse(volcano$trans_p_value > 1.3, "white", "#D4D4D4"))))+
+        scale_x_continuous(breaks=seq(min(floor(volcano$FC), na.rm=T), max(ceiling(volcano$FC), na.rm=T), 1), 
+                           limits = c(min(floor(volcano$FC), na.rm=T), max(ceiling(volcano$FC), na.rm=T)))+
+        scale_y_continuous(breaks=seq(0, max(ceiling(volcano$trans_p_value)), 1), limits = c(0, max(ceiling(volcano$trans_p_value))))+
+        #geom_text_repel(data = volcano[volcano$gene_symbol %in% to_label, ], aes(label = gene_symbol))+
+        theme_prism(base_size = 15)+
+        geom_hline(aes(yintercept = 1.3), linetype = "dashed", size = 1.5)+
+        labs(title = plot_title,
+             x = paste("Log2 fold change", "\n", y), y = "-log10 p-value")
+      
+      
+      if(interactive == TRUE & save == FALSE){
+        w = ggplotly(q, tooltip = 'all')
+        print(w)
+      }
+      else if(interactive == TRUE & save == TRUE){
+        w = ggplotly(q, tooltip = 'all')
+        saveWidget(w, paste(save_name, ".html"), selfcontained = T, libdir = "lib")
+      }
+      else if(interactive == FALSE & save == FALSE){
+        q1 = q + annotate("text", label = neg_chg, x = min(floor(volcano$FC)) + 0.2, y = max(ceiling(volcano$trans_p_value))) +
+          annotate("text", label = pos_chg, x = max(ceiling(volcano$FC)) - 0.2 , y = max(ceiling(volcano$trans_p_value)))
+        
+        print(q1)
+      }
+      else if(interactive == FALSE & save == TRUE){
+        q1 = q + annotate("text", label = neg_chg, x = min(floor(volcano$FC)) + 0.2, y = max(ceiling(volcano$trans_p_value))) +
+          annotate("text", label = pos_chg, x = max(ceiling(volcano$FC)) - 0.2 , y = max(ceiling(volcano$trans_p_value)))
+        
+        ggsave(q1, filename = paste0(save_name, ".pdf"), width = 6, height = 5, units = "in", bg='transparent')
+        while (!is.null(dev.list()))  dev.off()
+      }
+    }
+    
+  })
+  
+}
+
+v_plot = volcano_plot(df=int2, type = 'protein', interactive = F, filter_mito = T,
+                      plot_title = "SkM Mito Proteins",  save = T)    
+
+
+```
+
+
+### pathfindR
+Using the reactome gene set list from msigdb. Note that this analysis would be pretty different if an alternative gene set was used, such as kegg.
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+mmu_msigdb = pathfindR::get_gene_sets_list(source = "MSigDB", species = "Mus musculus", collection = "C2", subcollection = "CP:REACTOME" )
+
+mmu_genes = mmu_msigdb$gene_sets
+mmu_desc = mmu_msigdb$descriptions
+
+pathfind = function(df, export_name, export_data = FALSE, save_plot = FALSE){
+  
+  layer1 = map(rownames(comparison), function(y){
+    
+    int1 = df %>%
+      dplyr::select(., gene_symbol, contains(y)) %>%
+      dplyr::select(Gene_symbol = gene_symbol, logFC = contains('FC'), 
+                    FDR_p = contains('adj.pvalue')) %>%
+      drop_na(.) %>%
+      as.data.frame()
+    
+    
+    if(nrow(filter(int1, FDR_p < 0.1)) < 5){
+      print("not enough proteins with a q.value < 0.1")
+      
+    }
+    else{
+      
+      output = run_pathfindR(input = int1,
+                             convert2alias = FALSE,
+                             gene_sets = "Custom",
+                             pin_name_path = "STRING",
+                             #pin_name_path = path_to_pin_file,
+                             custom_genes = mmu_genes,
+                             custom_descriptions = mmu_desc,
+                             visualize_enriched_terms = F,
+                             p_val_threshold = 0.05,
+                             plot_enrichment_chart = F,
+                             silent_option = F,
+                             n_processes = 2)
+      
+      
+      if(export_data == TRUE){
+        
+        expt = list("grouped_term_output" = output,
+                    "sample_term_values" = int1)
+        
+        write.xlsx(expt, file = paste0(Sys.Date(),"_pathfindR_results_", export_name, y, ".xlsx"))
+        
+      }
+      
+      return(output)
+    }
+    
+  })
+  
+}
+
+path_analysis = pathfind(df=int, export_name = "TRF1_SKM_MSigDB", export_data = F)
+
+
+
+```
+
+## creating the bubble plot
+had to customize this function, originally from the pathfindR package. Needed it to change the color gradient and increase the point size.
+```{r fig.width=12}
+
+enricment_chart2 = function(result_df, plot_title, top_terms = 20, plot_by_cluster = FALSE, num_bubbles = 4, even_breaks = FALSE, save_plot){ 
+  
+  plt1 = map2(result_df, rownames(comparison), function(x,y){
+    
+    necessary <- c("Term_Description", "Fold_Enrichment", 
+                   "lowest_p", "Up_regulated", "Down_regulated")
+    if (!all(necessary %in% colnames(x))) {
+      stop("The input data frame must have the columns:\n", 
+           paste(necessary, collapse = ", "))
+    }
+    if (!is.logical(plot_by_cluster)) {
+      stop("`plot_by_cluster` must be either TRUE or FALSE")
+    }
+    if (!is.numeric(top_terms) & !is.null(top_terms)) {
+      stop("`top_terms` must be either numeric or NULL")
+    }
+    if (!is.null(top_terms)) {
+      if (top_terms < 1) {
+        stop("`top_terms` must be > 1")
+      }
+    }
+    result_df <- x[order(x$lowest_p), ]
+    if (!is.null(top_terms)) {
+      if (plot_by_cluster & "Cluster" %in% colnames(result_df)) {
+        keep_ids <- tapply(result_df$ID, result_df$Cluster, 
+                           function(x) x[seq_len(min(top_terms, length(x)))])
+        keep_ids <- unlist(keep_ids)
+        result_df <- result_df[result_df$ID %in% keep_ids, 
+        ]
+      }
+      else if (top_terms < nrow(result_df)) {
+        result_df <- result_df[seq_len(top_terms), ]
+      }
+    }
+    num_genes <- vapply(result_df$Up_regulated, function(x) length(unlist(strsplit(x, ", "))), 1)
+    num_genes <- num_genes + vapply(result_df$Down_regulated, 
+                                    function(x) length(unlist(strsplit(x, ", "))), 1)
+    
+    result_df$Term_Description <- factor(result_df$Term_Description, levels = rev(unique(result_df$Term_Description)))
+    log_p <- -log10(result_df$lowest_p)
+    
+    num_genes2 = num_genes + 10
+    
+    result_df = cbind(result_df, total_genes = num_genes)
+    
+    g <- ggplot2::ggplot(result_df, ggplot2::aes_(~Fold_Enrichment, ~reorder(Term_Description, Fold_Enrichment))) +
+      geom_point(ggplot2::aes(color = log_p, size = num_genes), na.rm = TRUE) +
+      scale_size_continuous(range = c(2,6))+
+      theme_bw()+
+      ggplot2::xlab("Fold Enrichment") +
+      ggplot2::labs(title = paste(plot_title, "\n", toupper(y), "\n", sep = " ")) +
+      ggplot2::scale_color_gradient(low = "gray25", high = "#A00000")+
+      ggplot2::labs(size = "# genes", color = expression(-log[10](p))) +
+      ggplot2::theme(axis.title.y = ggplot2::element_blank(), legend.title = element_text(),
+                     axis.text.y = ggplot2::element_text(color="black"),
+                     axis.text.x = ggplot2::element_text(color="black"))
+    
+    if(save_plot == T){
+      g <- ggsave(paste("bubble_plot", plot_title, ".pdf"), units = "in", bg='transparent')
+      while (!is.null(dev.list()))  dev.off()
+    }
+    else{print(g)}
+    
+  }
+  
+  )}
+
+plot1 = enricment_chart2(result_df = path_analysis, plot_title = "TRF1_SKM", save_plot = F)
+
+```
+
+### making example stacked barplot
+```{r}
+
+prot_path = read.xlsx("trf1_skm_data/Copy of Copy of 2022-10-19_TRF1_SKM_TMT_Fragpipe_msstats.dm.xlsx", sheet = 4)
+
+paths = c("MR", "ATP", "ETC", "FA", "TCA")
+
+prot2 = prot_path %>%
+  rename(., pathway = X3) %>%
+  filter(!is.na(pathway)) %>%
+  filter(pathway %in% paths) %>%
+  mutate(dir = ifelse(`log2FC_TRF-AL` > 0, "Up", "Down")) %>%
+  mutate(dir = factor(dir, levels = c("Up", "Down"))) %>%
+  group_by(pathway, dir) %>%
+  summarize(n = n())
+
+prot3 = prot_path %>%
+  rename(., pathway = X3) %>%
+  filter(!is.na(pathway)) %>%
+  filter(pathway %in% paths) %>%
+  mutate(dir = ifelse(`log2FC_TRF-AL` > 0, "Up", "Down")) %>%
+  mutate(dir = factor(dir, levels = c("Down", "Up"))) %>%
+  mutate(pathway = factor(pathway, levels = c("MR", "ETC", "FA", "ATP", "TCA")))
+         
+ggplot(prot3, aes(x = pathway, fill = dir))+
+  geom_bar() +
+  theme_prism(palette = 'colors') +
+  labs(x="", title = "SkM mito protein pathways \n as stacked total") +
+  scale_fill_manual(values = c("blue", "red"))
+
+
+#write.xlsx(list(prot3, prot2), "TRF1_skm_stacked_barplot_data.xlsx", sheetName = c("cleaned_data", "final_values"))
+
+```
+
